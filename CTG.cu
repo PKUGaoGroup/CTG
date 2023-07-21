@@ -1,3 +1,18 @@
+/*
+* Copyright 2023 Gao's lab, Peking University, CCME. All rights reserved.
+*
+* NOTICE TO LICENSEE:
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+* http://www.apache.org/licenses/LICENSE-2.0
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*/
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -6,7 +21,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <vector>
-#include <omp.h>
 
 __global__ void L1_Distance(const int n,const int i,const float *col_i,const float *matrix,float *dis_col_i)
 {
@@ -25,8 +39,6 @@ __global__ void L1_Distance(const int n,const int i,const float *col_i,const flo
 }
 int main(int argn, char *argv[])
 {
-	double time_1 = omp_get_wtime();
-
 	FILE *matrix_in = NULL;
 	FILE *matrix_out = NULL;
 	int n = 0;
@@ -34,7 +46,7 @@ int main(int argn, char *argv[])
 	float alpha = 0.3f;
 	cublasHandle_t cuhandle;
 
-	//命令行内读入 parameter
+	//input parameter
 	for (int i = 0; i < argn; i = i + 1)
 	{
 		if (strcmp(argv[i], "-i") == 0)
@@ -59,7 +71,7 @@ int main(int argn, char *argv[])
 		}
 	}
 
-	//安全检查 security check
+	//security check
 	if (matrix_in == NULL)
 	{
 		printf("Please input a correct matrix name, after -i\n");
@@ -73,11 +85,11 @@ int main(int argn, char *argv[])
 		return 0;
 	}
 
-	//读入矩阵（总是默认矩阵的ij级数是从1开始）
 	//read matrix(start from 1)
 	std::vector<int> array_i;
 	std::vector<int> array_j;
 	std::vector<float> array_value;
+	int non_zero_count=0;
 	while (true)
 	{
 		int i, j;
@@ -100,13 +112,15 @@ int main(int argn, char *argv[])
 		{
 			n = j;
 		}
+		non_zero_count+=1;
 	}
 	n = n + 1;
-	printf("Matrix size is %d\n", n);
+	printf("Matrix size is %d\nNonzero number %d\n", n,non_zero_count);
 
-	//构造矩阵并复制到GPU上
+	//initial GPU and copy data to GPU
 	float *h_origin_matrix = NULL;
 	h_origin_matrix = (float*)malloc(sizeof(float)*n*n);
+	memset(h_origin_matrix,0,sizeof(float)*n*n);
 	float *d_origin_matrix = NULL;
 	cudaMalloc((void**)&d_origin_matrix, sizeof(float)*n*n);
 	for (int k = 0; k < array_i.size(); k = k + 1)
@@ -121,11 +135,11 @@ int main(int argn, char *argv[])
 		if (i == j)
 		{
 			h_origin_matrix[serial] = 0.f;
-		}
+		}//diagonal element set to 0.f
 	}
-	cudaMemcpy(d_origin_matrix, h_origin_matrix, sizeof(float)*n*n, cudaMemcpyHostToDevice);
-
-	//矩阵归一化(matrix normalization)
+	cudaError_t cudaerror=cudaMemcpy(d_origin_matrix, h_origin_matrix, sizeof(float)*n*n, cudaMemcpyHostToDevice);
+	
+	//(matrix normalization)
 	std::vector<int>col_zero_record;
 	cublasCreate(&cuhandle);
 	for (size_t col_i = 0; col_i < n; col_i = col_i + 1)
@@ -144,10 +158,7 @@ int main(int argn, char *argv[])
 		}
 	}
 
-	double time_2 = omp_get_wtime();
-	printf("time during start and normalization %lf\n", time_2 - time_1);
-
-	//迭代
+	//itetration (matrix multiplication)
 	const float one = 1.f;
 	const float zero = 0.f;
 	float *d_sum_matrix = NULL;
@@ -159,18 +170,19 @@ int main(int argn, char *argv[])
 	cudaMemcpy(d_k_matrix, d_origin_matrix, sizeof(float)*n*n, cudaMemcpyDeviceToDevice);
 	cudaMalloc((void**)&d_k_matrix_copy, sizeof(float)*n*n);
 	cudaMemcpy(d_k_matrix_copy, d_origin_matrix, sizeof(float)*n*n, cudaMemcpyDeviceToDevice);
+	printf("iteration start!\n");
 	for (int iteration_i = 0; iteration_i < iteration_numbers; iteration_i = iteration_i + 1)
 	{
+		printf("iteration %d!\n",iteration_i);
 		float factor = expf(-alpha*(iteration_i + 1));
 		cublasSaxpy(cuhandle, n*n, &factor, d_k_matrix, 1, d_sum_matrix, 1);
 		cublasSgemm(cuhandle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &one, d_k_matrix, n, d_origin_matrix, n, &zero, d_k_matrix_copy, n);
 		cudaMemcpy(d_k_matrix, d_k_matrix_copy, sizeof(float)*n*n, cudaMemcpyDeviceToDevice);
 	}
+	printf("iteration done!\n");
 
-	double time_3 = omp_get_wtime();
-	printf("time during iteration %lf\n", time_3 - time_2);
-
-	//计算L1距离 (calculate L1 distance)
+	//(calculate L1 distance)
+	printf("L1 distance start!\n");
 	float *d_col_i = NULL;
 	cudaMalloc((void**)&d_col_i, sizeof(float)*n);
 	float *h_L1_matrix = NULL;
@@ -190,6 +202,10 @@ int main(int argn, char *argv[])
 		L1_Distance << <n, 256 >> >
 			(n, k, &d_sum_matrix[k * n], d_sum_matrix, d_col_i);
 		cudaMemcpy(&h_L1_matrix[k * n], d_col_i, sizeof(float)*n, cudaMemcpyDeviceToHost);
+		if(k%1000==0)
+		{
+			printf("L1 distance %d\n",k);
+		}
 	}
 	for (int i = 0; i < col_zero_record.size(); i = i + 1)
 	{
@@ -199,10 +215,8 @@ int main(int argn, char *argv[])
 			h_L1_matrix[col_zero_record[i] + n * j] = 0.f;
 		}
 	}
-
-	double time_4 = omp_get_wtime();
-	printf("time during L1 distance %lf\n", time_4 - time_3);
-
+	printf("L1 distance done!\n");
+	
 
 	if (matrix_out == NULL)
 	{
@@ -211,16 +225,6 @@ int main(int argn, char *argv[])
 	fwrite(h_L1_matrix, sizeof(float), n*n, matrix_out);
 	fclose(matrix_out);
 
-	printf("done! total time consuming %lf\n", omp_get_wtime() - time_1);
-	getchar();
-
-	//debug
-	/*cudaMemcpy(h_origin_matrix, h_L1_matrix, sizeof(float)*n*n, cudaMemcpyHostToHost);
-	printf("%d:\n", 0);
-	printf("%f %f %f\n%f %f %f\n%f %f %f\n\n",
-		h_origin_matrix[0], h_origin_matrix[1], h_origin_matrix[2],
-		h_origin_matrix[3], h_origin_matrix[4], h_origin_matrix[5],
-		h_origin_matrix[6], h_origin_matrix[7], h_origin_matrix[8]);*/
-
+	printf("done!");
 	return 0;
 }
